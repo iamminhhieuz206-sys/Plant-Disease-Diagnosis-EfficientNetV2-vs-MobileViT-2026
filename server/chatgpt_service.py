@@ -1,5 +1,6 @@
 from openai import OpenAI
 import os
+import base64
 from dotenv import load_dotenv
 from typing import Generator
 
@@ -26,6 +27,73 @@ PHẠM VI CHUYÊN MÔN:
 
 Nếu câu hỏi ngoài phạm vi nông nghiệp, hãy lịch sự từ chối và hướng về chủ đề cây trồng."""
 
+
+# ============================================================
+# VALIDATE ẢNH — dùng GPT-4 Vision
+# ============================================================
+
+def validate_plant_image(image_bytes: bytes) -> dict:
+    """
+    Kiểm tra ảnh có phải lá cây / cây trồng không.
+    Trả về: {"is_plant": bool, "message": str}
+    """
+    base64_image = base64.b64encode(image_bytes).decode("utf-8")
+
+    response = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}",
+                            "detail": "low",  # tiết kiệm token
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "Ảnh này có phải là ảnh lá cây, cây trồng, hoặc bộ phận cây "
+                            "(lá, thân, quả, rễ) không?\n"
+                            "Trả lời đúng 1 trong 2 dạng:\n"
+                            "YES nếu đúng là cây/lá cây.\n"
+                            "NO: <lý do ngắn gọn bằng tiếng Việt> nếu không phải."
+                        ),
+                    },
+                ],
+            }
+        ],
+        max_tokens=60,
+        temperature=0,
+    )
+
+    answer = response.choices[0].message.content.strip()
+
+    if answer.upper().startswith("YES"):
+        return {"is_plant": True, "message": ""}
+    else:
+        # Bỏ tiền tố "NO" hoặc "NO:" ở đầu
+        reason = answer
+        for prefix in ("NO:", "NO"):
+            if reason.upper().startswith(prefix):
+                reason = reason[len(prefix):].strip(" :")
+                break
+
+        return {
+            "is_plant": False,
+            "message": (
+                f"⚠️ Ảnh không hợp lệ: {reason}\n\n"
+                "📷 Vui lòng chụp lại ảnh **lá cây hoặc cây trồng** "
+                "để AI có thể chẩn đoán bệnh chính xác."
+            ),
+        }
+
+
+# ============================================================
+# CHAT
+# ============================================================
 
 def ask_chatgpt(messages: list[dict]) -> str:
     """Gọi ChatGPT với toàn bộ lịch sử hội thoại."""
