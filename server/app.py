@@ -6,21 +6,23 @@ import uuid
 import json
 
 from predict import predict_disease
-from chatgpt_service import ask_chatgpt, ask_chatgpt_stream, build_disease_analysis_prompt
+from chatgpt_service import (
+    ask_chatgpt,
+    ask_chatgpt_stream,
+    build_disease_analysis_prompt,
+    validate_plant_image,
+)
 
 app = FastAPI(title="Plant Doctor AI", version="2.0")
 
 
 # ============================================================
 # SESSION STORE
-# Mỗi conversation_id lưu riêng:
-#   - disease: bệnh đã chẩn đoán (nếu có)
-#   - history: danh sách {role, content} để GPT nhớ ngữ cảnh
 # ============================================================
 
 sessions: dict[str, dict] = {}
 
-MAX_HISTORY = 20  # Giữ tối đa 20 lượt để tránh token quá lớn
+MAX_HISTORY = 20
 
 
 def get_session(conversation_id: str) -> dict:
@@ -33,7 +35,6 @@ def get_session(conversation_id: str) -> dict:
 
 
 def trim_history(history: list) -> list:
-    """Giữ tối đa MAX_HISTORY tin nhắn gần nhất."""
     if len(history) > MAX_HISTORY:
         return history[-MAX_HISTORY:]
     return history
@@ -58,7 +59,6 @@ class NewConversationResponse(BaseModel):
 
 @app.post("/conversation/new", response_model=NewConversationResponse)
 async def new_conversation():
-    """Tạo session mới, trả về conversation_id."""
     conv_id = str(uuid.uuid4())
     sessions[conv_id] = {"disease": None, "history": []}
     return {"conversation_id": conv_id}
@@ -73,29 +73,39 @@ async def detect(
     file: UploadFile = File(...),
     conversation_id: Optional[str] = None,
 ):
-    # Tạo session nếu chưa có
     if not conversation_id:
         conversation_id = str(uuid.uuid4())
-    
+
     session = get_session(conversation_id)
 
-    # Đọc và nhận diện ảnh
     image_bytes = await file.read()
     if not image_bytes:
         raise HTTPException(status_code=400, detail="File ảnh rỗng")
 
+    # ── BƯỚC 1: Validate ảnh bằng GPT Vision ──────────────────
+    try:
+        validation = validate_plant_image(image_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi kiểm tra ảnh: {str(e)}")
+
+    if not validation["is_plant"]:
+        # Ảnh không phải cây — trả về thông báo, không chạy model
+        return {
+            "conversation_id": conversation_id,
+            "disease": None,
+            "solution": validation["message"],
+        }
+
+    # ── BƯỚC 2: Nhận diện bệnh (chỉ chạy nếu ảnh hợp lệ) ─────
     try:
         disease = predict_disease(image_bytes)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi nhận diện: {str(e)}")
 
-    # Lưu bệnh vào session
     session["disease"] = disease
 
-    # Tạo prompt phân tích bệnh chi tiết
     analysis_prompt = build_disease_analysis_prompt(disease)
 
-    # Thêm vào history: user gửi ảnh → AI phân tích
     session["history"].append({
         "role": "user",
         "content": f"[Người dùng đã chụp ảnh lá cây] AI nhận diện bệnh: {disease}\n\nHãy phân tích chi tiết bệnh này."
@@ -106,7 +116,6 @@ async def detect(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi ChatGPT: {str(e)}")
 
-    # Lưu phản hồi AI vào history
     session["history"].append({
         "role": "assistant",
         "content": solution
@@ -116,7 +125,7 @@ async def detect(
     return {
         "conversation_id": conversation_id,
         "disease": disease,
-        "solution": solution
+        "solution": solution,
     }
 
 
@@ -131,7 +140,6 @@ async def chat(req: ChatRequest):
 
     session = get_session(req.conversation_id)
 
-    # Xây dựng user message — thêm context bệnh nếu có
     if session["disease"] and not _is_about_disease(req.question, session["disease"]):
         user_content = f"[Ngữ cảnh: cây đang mắc bệnh {session['disease']}]\n{req.question}"
     else:
@@ -142,7 +150,7 @@ async def chat(req: ChatRequest):
     try:
         answer = ask_chatgpt(session["history"])
     except Exception as e:
-        session["history"].pop()  # Rollback nếu lỗi
+        session["history"].pop()
         raise HTTPException(status_code=500, detail=f"Lỗi ChatGPT: {str(e)}")
 
     session["history"].append({"role": "assistant", "content": answer})
@@ -150,7 +158,7 @@ async def chat(req: ChatRequest):
 
     return {
         "conversation_id": req.conversation_id,
-        "answer": answer
+        "answer": answer,
     }
 
 
@@ -172,7 +180,6 @@ async def chat_stream(req: ChatRequest):
 
     session["history"].append({"role": "user", "content": user_content})
 
-    # Chạy streaming và đồng thời tích lũy để lưu history
     history_snapshot = list(session["history"])
 
     async def event_generator():
@@ -180,13 +187,10 @@ async def chat_stream(req: ChatRequest):
         try:
             for chunk in ask_chatgpt_stream(history_snapshot):
                 full_response.append(chunk)
-                # Encode JSON để giữ nguyên space, newline, ký tự đặc biệt
-                # Flutter parse: json.decode(part) để lấy lại text gốc
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-            
+
             yield "data: [DONE]\n\n"
 
-            # Lưu phản hồi đầy đủ vào history
             complete = "".join(full_response)
             session["history"].append({"role": "assistant", "content": complete})
             session["history"] = trim_history(session["history"])
@@ -195,7 +199,7 @@ async def chat_stream(req: ChatRequest):
             yield f"data: {json.dumps('⚠️ Lỗi: ' + str(e), ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
             if session["history"]:
-                session["history"].pop()  # Rollback
+                session["history"].pop()
 
     return StreamingResponse(
         event_generator(),
@@ -203,12 +207,12 @@ async def chat_stream(req: ChatRequest):
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
-        }
+        },
     )
 
 
 # ============================================================
-# API 4: XOÁ SESSION (khi user xoá conversation)
+# API 4: XOÁ SESSION
 # ============================================================
 
 @app.delete("/conversation/{conversation_id}")
@@ -223,10 +227,8 @@ async def delete_conversation(conversation_id: str):
 # ============================================================
 
 def _is_about_disease(question: str, disease: str) -> bool:
-    """Kiểm tra xem câu hỏi có liên quan đến bệnh đã chẩn đoán không."""
     q_lower = question.lower()
     d_lower = disease.lower()
-    # Nếu người dùng nhắc tên bệnh hoặc hỏi chung về bệnh
     keywords = ["bệnh", "thuốc", "xử lý", "điều trị", "triệu chứng", "nguyên nhân"]
     return any(k in q_lower for k in keywords) or any(
         word in q_lower for word in d_lower.split()
